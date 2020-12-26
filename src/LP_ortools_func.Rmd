@@ -1,0 +1,897 @@
+---
+title: "Capacity Linear Program"
+resource_files:
+- lp_test_profiles_8760_2018_re_diverse.csv
+- lp_test_profiles_8760_2018_re.csv
+- lp_test_hydro_data.csv
+- .Rprofile
+
+runtime: shiny
+output:
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    theme: bootstrap
+    vertical_layout: scroll
+---
+
+```{r setup, include=FALSE}
+# see for using reticulate with shiny
+# https://rviews.rstudio.com/2018/04/17/reticulated-shiny/
+
+# knitr::opts_chunk$set(echo = TRUE)
+
+# Sys.setenv('RETICULATE_PYTHON'='.virtualenvs/LP/bin/python')
+
+
+library(flexdashboard)
+library(shiny)
+library(DT)
+# library(shinycssloaders)
+
+library(plotly)
+
+library(data.table)
+
+library(reticulate)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(magrittr)
+library(viridis)
+library(RColorBrewer)
+library(ggplot2)
+library(ggthemes)
+library(readr)
+
+
+# renv::snapshot()
+
+# cannot use conda environmet with shinyapps.io
+# use virtual envs instead
+if('LP' %in% virtualenv_list()){
+  use_virtualenv('LP', required = T)
+} else {
+  virtualenv_create('LP')
+  virtualenv_install('LP', c('ortools', 'pandas', 'seaborn'))
+  use_virtualenv('LP', required = T)}
+
+
+
+# set plot theme
+# this_theme = theme_few(base_size = 14)
+base_text_size = 18
+
+
+# create a container for reactive values
+# this will hold datasets
+# r = reactiveValues()
+
+
+# option for datatable javascript
+# https://rstudio.github.io/DT/options.html
+dt_opts = list(
+      autoWidth = TRUE,
+      scrollCollapse = FALSE,
+      scroller = TRUE,
+      deferRender = FALSE,
+      scrollX = TRUE,
+      scrollY = TRUE,
+      dom = 'tB',
+      # buttons = c('csv', 'pdf')
+      buttons = c('csv', 'excel')
+    )
+
+```
+
+
+
+<!-- ################################################### -->
+<!-- beginning inputs and plot tab -->
+<!-- ################################################### -->
+
+
+
+Optimization inputs and plots
+===================================== 
+
+Inputs{.sidebar}
+-----------------------------------------------------------------------
+
+### Inputs to optimization
+
+
+```{r inputs}
+
+#############################################################
+# dataset contains the most recent forecast from 
+# the forecast providers
+#############################################################
+# Create the object with no values
+#values <- reactiveValues()
+
+fixed_vars = reactiveValues()
+
+# limit on the amount of energy we can sell in any hour
+fixed_vars$max_mw_export_cap = 150
+
+
+# radioButtons('profile_year', 'Profile year',
+#              choices = c('use_avg_profiles', 
+#                          'use_2017_profiles',
+#                          'use_2018_profiles'),
+#              selected = 'use_2018_profiles')
+radioButtons('diverse_profile', 'Use diverse RE locations',
+             choices = c('Yes', 'No'),
+             selected = 'Yes',
+             inline = TRUE)
+
+get_diverse_profile = eventReactive(input$diverse_profile, {input$diverse_profile})
+
+
+sliderInput('peak_load', 'Annual peak load (MW)',
+            min = 500, max = 1500, value = 1000, step = 100)
+get_peak_load= eventReactive(input$peak_load, {input$peak_load})
+
+
+sliderInput('restrict_gas', 'Max gas gen. as % of load',
+            min = 0, max = 100, value = 10, step = 0.5)
+get_restrict_gas = eventReactive(input$restrict_gas, {input$restrict_gas})
+
+
+# battery parameters
+min_charge_level = 0.1
+init_ch_level = 0.5
+batt_hours = 4
+batt_eff = 0.85
+
+
+
+
+sliderInput('co2_cost', 'CO2 cost ($/ton)',
+            min = 0, max = 1000, value = 60, step = 10)
+get_co2_cost = eventReactive(input$co2_cost, {input$co2_cost})
+
+sliderInput('wind_cost', 'Wind cost ($/MWh)',
+            min = 15, max = 40, value = 26.25, step = 0.01)
+
+sliderInput('solar_cost', 'Solar cost ($/MWh)',
+            min = 15, max = 45, value = 33.68, step = 0.01)
+get_solar_mwh_cost = eventReactive(input$solar_cost, {input$solar_cost})
+
+sliderInput('batt_cost', 'Battery cost ($/KW-Mo)',
+            min = 4, max = 12, value = 8.25, step = 0.01)
+get_batt_cost = eventReactive(input$batt_cost, {input$batt_cost})
+
+sliderInput('gas_cap_cost', 'Gas capacity cost ($/KW-Mo)',
+            min = 6, max = 20, value = 10.94, step = 0.01)
+get_gas_cap_cost = eventReactive(input$gas_cap_cost, {input$gas_cap_cost})
+
+sliderInput('gas_fuel_cost', 'Gas fuel cost ($/MMBTu)',
+            min = 2, max = 8, value = 4.37, step = 0.01)
+get_gas_fuel_cost = eventReactive(input$gas_fuel_cost, {input$gas_fuel_cost})
+
+
+use_outside_energy = F
+outside_energy_cost = 10000
+
+
+actionButton('run_lp', 'Run optimization')
+
+
+# amount of CO2 per MW and MWh
+# CO2 values from CSU study
+gas_co2_ton_per_mwh = (411 + 854)/2000
+# assumed 30 year life
+gas_co2_ton_per_mw = (5981+1000+35566+8210+10165+1425)/(6*18)/30
+
+wind_co2_ton_per_mwh = 0.2/2000
+# assumed 30 year life
+wind_co2_ton_per_mw = (754+10-241)/30
+
+solar_co2_ton_per_mwh = 2.1/2000
+# assumed 30 year life
+solar_co2_ton_per_mw = (1202+250-46)/30
+
+# battery C02 given in lbs
+# assumed 15 year life
+batt_co2_ton_per_mw = (1940400-83481+4903)/2000/15
+
+
+# get cost of carbon for each resource
+cc_gas_mwh = eventReactive(input$co2_cost, {input$co2_cost * gas_co2_ton_per_mwh})
+cc_gas_mw = eventReactive(input$co2_cost, {input$co2_cost * gas_co2_ton_per_mw})
+
+cc_wind_mwh = eventReactive(input$co2_cost, {input$co2_cost * wind_co2_ton_per_mwh})
+cc_wind_mw = eventReactive(input$co2_cost, {input$co2_cost * wind_co2_ton_per_mw})
+
+cc_solar_mwh = eventReactive(input$co2_cost, {input$co2_cost *solar_co2_ton_per_mwh})
+cc_solar_mw = eventReactive(input$co2_cost, {input$co2_cost * solar_co2_ton_per_mw})
+
+cc_batt_mw = eventReactive(input$co2_cost, {input$co2_cost * batt_co2_ton_per_mw})
+
+
+# calculate fixed and variable costs for resources
+# these will be passed into the run_lp function
+get_gas_mw_cost = eventReactive(c(input$gas_cap_cost,input$co2_cost),
+                                   {cc_gas_mw() + input$gas_cap_cost*12*1000})
+
+heat_rate = 8403 # btu/kwh
+vom = 6.73 # $/mwh
+gas_trans_cost = 1.06 # transportation cost in $/mmbtu
+get_gas_mwh_cost = eventReactive(c(input$gas_fuel_cost,input$co2_cost),
+                                      {cc_gas_mwh() +
+                                          (input$gas_fuel_cost+gas_trans_cost)*heat_rate/1000 +
+                                          vom})
+
+
+get_batt_mw_cost = eventReactive(c(input$batt_cost,input$co2_cost),
+                                   {cc_batt_mw() + input$batt_cost*12*1000})
+
+
+wind_kw_mo = 4.85 # includes PSCo schedule 3VER
+get_wind_mw_cost = eventReactive(input$co2_cost,
+                {cc_wind_mw() + wind_kw_mo*12*1000})
+
+get_wind_mwh_cost = eventReactive(c(input$wind_cost, input$co2_cost),
+                                       {cc_wind_mwh() + input$wind_cost})
+
+
+solar_kw_mo = 0.19 # PSCo schedule 3VER
+get_solar_mw_cost = eventReactive(input$co2_cost,
+                {cc_solar_mw() + solar_kw_mo*12*1000})
+get_solar_mwh_cost = eventReactive(c(input$solar_cost, input$co2_cost),
+                                        {cc_solar_mwh() + input$solar_cost})
+
+
+```
+
+
+
+```{r input_selections, include=F}
+
+renderText(input$diverse_profile)
+renderText(get_diverse_profile())
+renderText(class(get_diverse_profile()))
+renderText(input$co2_cost)
+renderText(input$run_lp)
+renderText(input$value_of_excess)
+renderText(get_excess_val())
+
+
+```
+
+
+
+
+
+
+
+<!-- ################################################### -->
+<!-- capacity and supply costs value boxes -->
+<!-- ################################################### -->
+
+
+Row{data-height=150}
+-----------------------------------------------------------------------
+
+### Wind MW {.value-box}
+
+```{r value_box_wind}
+
+get_wind_mw = eventReactive(c(input$run_lp, fixed_vars$final_df),
+                            {fixed_vars$wind})
+
+renderValueBox({
+  val = ifelse(is.null(fixed_vars$final_df), '-', get_wind_mw())
+  valueBox(val)
+})
+
+```
+
+### Solar MW {.value-box}
+
+```{r value_box_solar}
+
+get_solar_mw = eventReactive(c(input$run_lp, fixed_vars$final_df),
+                            {fixed_vars$solar})
+
+renderValueBox({
+  val = ifelse(is.null(fixed_vars$final_df), '-', get_solar_mw())
+  valueBox(val)
+})
+
+```
+
+### Battery MW {.value-box}
+
+```{r value_box_batt}
+get_batt_mw = eventReactive(c(input$run_lp, fixed_vars$final_df),
+                            {fixed_vars$batt})
+
+renderValueBox({
+  val = ifelse(is.null(fixed_vars$final_df), '-', get_batt_mw())
+  valueBox(val)
+})
+
+```
+
+### Gas MW {.value-box}
+
+```{r value_box_gas}
+get_gas_mw = eventReactive(c(input$run_lp, fixed_vars$final_df),
+                            {fixed_vars$gas})
+
+renderValueBox({
+  val = ifelse(is.null(fixed_vars$final_df), '-', get_gas_mw())
+  valueBox(val)
+})
+
+```
+
+
+
+### Tons of CO2 (thou) {.value-box}
+
+```{r value_box_co2}
+
+get_co2 = eventReactive(c(input$run_lp, fixed_vars$final_df),
+                            {
+                              gas_gen = sum(fixed_vars$final_df$gas)
+                              wind_gen = sum(fixed_vars$final_df$wind)
+                              solar_gen = sum(fixed_vars$final_df$solar)
+                              
+                              gas_co2_ton_per_mw*fixed_vars$gas +
+                              gas_co2_ton_per_mwh*gas_gen +
+                                
+                              wind_co2_ton_per_mw*fixed_vars$wind +
+                              wind_co2_ton_per_mwh*wind_gen +
+                                
+                              solar_co2_ton_per_mw*fixed_vars$solar +
+                              solar_co2_ton_per_mwh*solar_gen +
+                                
+                              batt_co2_ton_per_mw*fixed_vars$batt
+                            
+                            })
+
+renderValueBox({
+  val = ifelse(is.null(fixed_vars$final_df), '-', round(get_co2()/1000,1))
+  valueBox(val)
+})
+
+```
+
+
+
+
+
+
+<!-- ################################################### -->
+<!-- production metrics value boxes -->
+<!-- ################################################### -->
+
+
+Row{data-height=150}
+-----------------------------------------------------------------------
+
+### RE gen % of load {.value-box}
+
+```{r value_box_re_gen}
+
+get_re_gen = eventReactive(c(input$run_lp, fixed_vars$final_df),
+                            {
+                              solar_gen = sum(fixed_vars$final_df$solar)
+                              wind_gen = sum(fixed_vars$final_df$wind)
+                              total_load = sum(fixed_vars$final_df$load_2030)
+                              
+                              100*(solar_gen + wind_gen)/ total_load
+                              
+                              })
+
+renderValueBox({
+  val = ifelse(is.null(fixed_vars$final_df), '-', round(get_re_gen(),0))
+  valueBox(val)
+})
+
+```
+
+
+### Excess energy % of load {.value-box}
+
+```{r value_box_excess_gen}
+
+get_ex_gen = eventReactive(c(input$run_lp, fixed_vars$final_df),
+                            {
+                              net_load = sum(fixed_vars$final_df$load_net)
+                              total_load = sum(fixed_vars$final_df$load_2030)
+                              
+                              100*net_load/total_load
+                              
+                              })
+
+renderValueBox({
+  val = ifelse(is.null(fixed_vars$final_df), '-', round(get_ex_gen(),0))
+  valueBox(val)
+})
+
+```
+
+
+<!-- ### Battery loss % of load {.value-box} -->
+
+<!-- ```{r value_box_batt_loss} -->
+
+<!-- get_batt_loss = eventReactive(c(input$run_lp, fixed_vars$final_df), -->
+<!--                             { -->
+<!--                               batt_charge = sum(fixed_vars$final_df$batt_charge) -->
+<!--                               batt_discharge = sum(fixed_vars$final_df$batt_discharge) -->
+<!--                               total_load = sum(fixed_vars$final_df$load_2030) -->
+
+<!--                               100*(batt_charge - batt_discharge)/total_load -->
+
+<!--                               }) -->
+
+<!-- renderValueBox({ -->
+<!--   val = ifelse(is.null(fixed_vars$final_df), '-', round(get_batt_loss(),0)) -->
+<!--   valueBox(val) -->
+<!-- }) -->
+
+<!-- ``` -->
+
+
+### Gas gen % of load {.value-box}
+
+```{r value_box_gas_gen}
+
+get_gas_gen = eventReactive(c(input$run_lp, fixed_vars$final_df),
+                            {
+                              gas_gen = sum(fixed_vars$final_df$gas)
+                              total_load = sum(fixed_vars$final_df$load_2030)
+                              
+                              100*gas_gen/total_load
+                              
+                              })
+renderValueBox({
+  val = ifelse(is.null(fixed_vars$final_df), '-', round(get_gas_gen(),1))
+  valueBox(val)
+})
+
+```
+
+
+### Supply cost $M {.value-box}
+
+```{r value_box_supply_cost}
+
+get_obj_val = eventReactive(c(input$run_lp, 
+                              fixed_vars$final_df),
+                            
+            {fixed_vars$obj_val/1000000})
+
+get_excess_val = eventReactive(c(input$run_lp, 
+                              fixed_vars$final_df, 
+                              input$value_of_excess),
+                            
+            {
+              excess_for_sale = ifelse(fixed_vars$final_df$load_net >
+                                      fixed_vars$max_mw_export_cap,
+                                      fixed_vars$max_mw_export_cap,
+                                      fixed_vars$final_df$load_net)
+              
+              sum(input$value_of_excess*excess_for_sale)/1000000})
+
+renderValueBox({
+  # co2_cost = get_co2()*input$co2_cost/1000000
+  val = ifelse(is.null(fixed_vars$final_df), 
+               '-', 
+               round(get_obj_val()-get_excess_val()-get_co2_cost(),0)) #get_obj_val()-
+  valueBox(val)
+})
+
+```
+
+
+### Carbon cost $M {.value-box}
+
+```{r value_box_scc_cost}
+
+get_co2_cost = eventReactive(c(input$run_lp, 
+                              fixed_vars$final_df),
+                            
+            {get_co2()*input$co2_cost/1000000})
+
+renderValueBox({
+  # co2_cost = get_co2()*input$co2_cost/1000000
+  val = ifelse(is.null(fixed_vars$final_df), 
+               '-', 
+               round(get_co2_cost(),0)) #get_obj_val()-
+  valueBox(val)
+})
+
+```
+
+
+
+
+Row{data-height=100}
+-----------------------------------------------------------------------
+
+```{r plot_date}
+fillRow(
+
+  dateInput('plot_start_date', 'Plot start date', 
+           value = '2030-07-01', 
+          min = '2030-01-01', 
+          max = '2030-12-26'),
+
+
+
+sliderInput('value_of_excess', 'Average value of excess energy ($/MWh)',
+            min = 0, max = 50, value = 40, step = 1)
+)
+
+
+
+
+```
+
+
+
+Row{data-height=500}
+-----------------------------------------------------------------------
+
+### LP results plot
+
+```{r lp, include=F}
+
+
+
+
+
+source_python('LP_ortools_func.py')
+# def run_lp(profile_year
+#             ,restrict_gas
+#             ,min_charge_level
+#             ,init_ch_level
+#             ,batt_hours
+#             ,batt_eff
+#             ,gas_co2_ton_per_mwh
+#             ,gas_co2_ton_per_mw
+#             ,wind_co2_ton_per_mwh
+#             ,wind_co2_ton_per_mw
+#             ,solar_co2_ton_per_mwh
+#             ,solar_co2_ton_per_mw
+#             ,batt_co2_ton_per_mw
+#             ,co2_cost
+#             ,use_outside_energy
+#             ,outside_energy_cost
+#             ,gas_mw_cost
+#             ,gas_mwh_cost
+#             ,batt_mw_cost
+#             ,wind_mw_cost
+#             ,wind_mwh_cost
+#             ,solar_mw_cost
+#             ,solar_mwh_cost
+#             ):
+
+
+  observeEvent(input$run_lp,
+             # {print('starting model run')
+             {
+              fixed_vars$model_text = 'Model status: starting optimization'
+               
+              results = run_lp(diverse_profile = get_diverse_profile(),
+                 peak_load = get_peak_load(),
+                 restrict_gas = get_restrict_gas(),
+                 min_charge_level = min_charge_level,
+                 init_ch_level = init_ch_level,
+                 batt_hours = batt_hours,
+                 batt_eff = batt_eff,
+                 use_outside_energy = use_outside_energy,
+                 outside_energy_cost = outside_energy_cost,
+                 gas_mw_cost = get_gas_mw_cost(),
+                 gas_mwh_cost = get_gas_mwh_cost(),
+                 batt_mw_cost = get_batt_mw_cost(),
+                 wind_mw_cost = get_wind_mw_cost(),
+                 wind_mwh_cost = get_wind_mwh_cost(),
+                 solar_mw_cost = get_solar_mw_cost(),
+                 solar_mwh_cost = get_solar_mwh_cost()
+)
+              
+              fixed_vars$model_text = 'Model status: finished optimization'
+
+              final_df = py_to_r(results$final_df) %>%
+                as_tibble(rownames = 'time') 
+
+              final_df = final_df %>%
+                mutate(time = ymd_hms(time)) %>%
+                rename('load_2030' = '2030_load',
+                       'load_net' = 'net_load')
+
+              fixed_vars$final_df = final_df
+              
+              try(write_csv(fixed_vars$final_df, 'final_df_r.csv'))
+              
+              # get capacity
+              fixed_vars$wind = round(results$cap_mw$wind_mw,0)
+              fixed_vars$solar = round(results$cap_mw$solar_mw,0)
+              fixed_vars$batt = round(results$cap_mw$batt_mw,0)
+              fixed_vars$gas = round(results$cap_mw$gas_mw,0)
+              
+              # get objective value
+              fixed_vars$obj_val = round(results$obj_val,0)
+              
+
+               }
+              ) 
+
+
+ 
+
+
+```
+
+
+
+```{r, check_vars, include=F}
+renderText(getwd())
+renderText(fixed_vars$model_text)
+renderText(nrow(fixed_vars$final_df))
+```
+
+
+
+```{r, hourly_plot}
+
+# renderText(fixed_vars$model_text)
+# renderText(nrow(fixed_vars$final_df))
+
+get_plot = eventReactive(c(input$run_lp, input$plot_start_date),
+  {
+        # function to plot hourly
+  plot_hourly = function(start_day = input$plot_start_date, num_days = 7){
+    # start_day = '2029-07-01'
+    # num_days = 5
+    
+    df_days = date(fixed_vars$final_df$time) %>% 
+      unique() %>%
+      ymd()
+    
+    if(any(ymd(start_day) %in% df_days)){
+      # t0 = start time, t1 = end time
+      t0 = which(date(fixed_vars$final_df$time) == ymd(start_day)) %>% min()
+    } else {
+      
+      start_day = sample(df_days[1:(length(df_days)-num_days)], 1)
+      t0 = which(fixed_vars$final_df$time == ymd(start_day))[1]
+    }
+    
+    t1 = t0 + 24*num_days
+    
+    
+    # source columns to plot
+    # cols = c('time', 'crsp', 'lap', 'solar', 'wind', 'batt_discharge', 'gas', 'outside_energy')
+    cols = c('time', 'solar', 'wind', 'batt_discharge', 'gas', 'outside_energy')
+    
+    col_idx = colnames(fixed_vars$final_df) %in% cols
+    
+    # for stacked area chart
+    pdata = fixed_vars$final_df[t0:t1,col_idx] %>%
+      pivot_longer(-time, names_to = 'Source', values_to = 'MW')
+    
+    # reorder levels for area plot
+    # pdata$Source = factor(pdata$Source, levels = cols[length(cols):2])
+    pdata$Source = factor(pdata$Source, 
+                        levels = c('solar', 'wind', 'batt_discharge', 'gas', 'outside_energy') %>%
+                          rev())
+    
+    # for load lines
+    df_load_2030 = fixed_vars$final_df[t0:t1,c('time', 'load_2030', 'load_and_charge')] %>%
+      pivot_longer(-time, names_to = 'Load', values_to = 'MW')
+    
+    
+    # display.brewer.all(colorblindFriendly = TRUE)
+    # The palette with black:
+      cbp2 <- c("#000000", # black
+            "#E69F00", # orange
+            "#56B4E9", # light blue
+            "#009E73", # green
+            "#F0E442", # light yellow
+            "#0072B2", # blue
+            "#D55E00", # dark orange
+            "#CC79A7") # purple
+    
+    n_source = pdata$Source %>% unique() %>% length()
+    # idxs = c(2,7,8,4,5,3,6)
+    idxs = c(2,7,8,4,5) # remove blues for hydro
+    # cbp2 = cbp2[c(6,3,5,4,8,7,2)]
+    cbp2 = cbp2[idxs[(length(idxs)-n_source+1):length(idxs)]]
+    
+    pdata %>%
+      ggplot(aes(x = time)) +
+      geom_area(aes(y = MW, fill = Source)) +
+      geom_line(data = df_load_2030,
+                aes(y = MW, linetype = Load), size = 0.75) +
+      xlab('') +
+      theme_minimal(base_size = base_text_size) +
+      scale_fill_manual(values = cbp2) +
+      theme(axis.text.x = element_text(angle = 90, vjust=0.5))
+      # scale_fill_viridis(discrete = TRUE)
+      # scale_fill_brewer(palette = "Paired")
+      # scale_fill_brewer(palette = "Set2")
+    
+  }
+  
+  if(!is.null(fixed_vars$final_df)){
+    p = plot_hourly()
+    p
+    
+  }
+ 
+  }
+)
+
+renderPlot({
+    
+    p = get_plot()
+    p
+    
+    # ggplotly(p, height = 600) %>%
+    # layout(legend = list(title = list(text=''),
+    #                              orientation = "h",
+    #                              x = 0, y = -0.4),
+    #         hovermode = 'compare',
+    #         # yaxis = list(hoverformat = ',.2f'),
+    #         title = list(text='')
+    #        )
+
+}) # renderPlotly
+
+```
+
+
+
+
+
+
+<!-- ################################################### -->
+<!-- beginning output data tab -->
+<!-- ################################################### -->
+
+
+
+Output data
+=====================================
+
+### Output data
+
+
+Row{data-height=700}
+-----------------------------------------------------------------------
+
+### LP results data
+
+```{r}
+
+# see https://github.com/rstudio/DT/issues/643
+# for header scrolling
+
+hourly_opts = list(
+      autoWidth = TRUE,
+      scrollCollapse = FALSE,
+      scroller = TRUE,
+      deferRender = FALSE,
+      scrollX = TRUE,
+      scrollY = 600,
+      dom = 'tB',
+      # buttons = c('csv', 'pdf')
+      # buttons = c('csv', 'excel')
+      buttons = c('csv')
+    )
+
+renderDataTable(
+    DT::datatable({
+
+        table_data = fixed_vars$final_df %>%
+          select(-Date)
+        
+        # round all but the first two columns
+        for(c in colnames(table_data)[c(-1,-2)]){
+            table_data[,c] = round(table_data[,c], 2)
+        }
+        
+        table_data
+
+    },
+
+    extensions = c('Buttons', 'Scroller'),
+    options = hourly_opts,
+    fillContainer = F,
+    class = "display"
+    )
+  )
+
+```
+
+
+
+
+
+
+<!-- ################################################### -->
+<!-- beginning input data tab -->
+<!-- ################################################### -->
+
+
+
+<!-- Input data -->
+<!-- ===================================== -->
+
+<!-- Row{data-height=200} -->
+<!-- ----------------------------------------------------------------------- -->
+
+<!-- ### Input data -->
+
+<!-- ```{r, get_inputs} -->
+
+
+<!-- get_inputs = eventReactive(c(input$profile_year, -->
+<!--                 input$restrict_gas,  -->
+<!--                 input$co2_cost,  -->
+<!--                 input$wind_cost, -->
+<!--                 input$solar_cost, -->
+<!--                 input$batt_cost, -->
+<!--                 input$gas_cap_cost, -->
+<!--                 input$gas_fuel_cost, -->
+<!--                 input$run_lp), -->
+<!--     { -->
+<!--       input_df = tibble( -->
+<!--        profile_year = input$profile_year, -->
+<!--        restrict_gas = input$restrict_gas, -->
+<!--        co2_cost = input$co2_cost, -->
+<!--        wind_cost = input$wind_cost, -->
+<!--        solar_cost = input$solar_cost, -->
+<!--        batt_cost = input$batt_cost, -->
+<!--        gas_cap_cost = input$gas_cap_cost, -->
+<!--        gas_fuel_cost = input$gas_fuel_cost -->
+<!--       ) -->
+
+<!--     # fixed_vars$model_text = 'Model status: gathered inputs' -->
+
+<!--     input_df -->
+
+<!--     } -->
+
+<!-- ) -->
+
+<!-- # see https://github.com/rstudio/DT/issues/643 -->
+<!-- # for header scrolling -->
+<!-- # option for datatable javascript -->
+<!-- # https://rstudio.github.io/DT/options.html -->
+<!-- input_opts = list( -->
+<!--       autoWidth = TRUE, -->
+<!--       scrollCollapse = FALSE, -->
+<!--       scroller = TRUE, -->
+<!--       deferRender = FALSE, -->
+<!--       scrollX = TRUE, -->
+<!--       scrollY = 100, -->
+<!--       dom = 'tB', -->
+<!--       # buttons = c('csv', 'pdf') -->
+<!--       buttons = c('csv', 'excel') -->
+<!--     ) -->
+
+<!-- renderDataTable( -->
+<!--     DT::datatable({ -->
+
+<!--         table_data = get_inputs()  -->
+
+<!--         table_data -->
+
+<!--     }, -->
+
+<!--     extensions = c('Buttons', 'Scroller'), -->
+<!--     options = input_opts, -->
+<!--     fillContainer = F, -->
+<!--     class = "display" -->
+<!--     ) -->
+<!--   ) -->
+<!-- ``` -->
